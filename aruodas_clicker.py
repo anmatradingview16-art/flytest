@@ -50,7 +50,7 @@ END_NUM = DEFAULT_END_NUM
 STEP = DEFAULT_STEP
 
 # Apsauga nuo per didelio intervalo (UI gali pasirinkti bet ką)
-MAX_RANGE_ITEMS = int(os.getenv("MAX_RANGE_ITEMS", "120000"))
+MAX_RANGE_ITEMS = int(os.getenv("MAX_RANGE_ITEMS", "500000"))
 
 # Maksimalus batch dydis (kiek ID galima paduoti į /api/check_batch vienu kartu)
 MAX_BATCH_IDS = int(os.getenv("MAX_BATCH_IDS", "1000"))
@@ -2042,4 +2042,5 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "5000"))
     app.run(host=host, port=port, debug=False)
+
 

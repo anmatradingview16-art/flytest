@@ -1,4 +1,23 @@
 # -*- coding: utf-8 -*-
+"""
+Šis įrankis skirtas tik testavimui / asmeniniams eksperimentams.
+NENAUDOKITE PRODUKCINĖJE APLINKOJE.
+
+Prieš naudodami įsivertinkite:
+- ar turite teisę / leidimą tikrinti trečiųjų šalių puslapius tokiu būdu,
+- ar nepažeidžiate taisyklių,
+- ar neapkraunate serverių.
+
+OPTIMIZACIJOS (2026):
+- „Visi ID“ lentelė rodoma puslapiais (nebekuriama 50k+ DOM eilučių).
+- Batch dydžiai UI papildyti (100..1000) + serverio MAX_BATCH_IDS default=1000.
+- RAW_CACHE apribotas (LRU) – kad serveris nepradėtų valgyti RAM.
+- Persistencijos (state) išsaugojimas į diską „throttle“ (nebepersistinama po kiekvieno ID).
+- Pridėtas /api/cache_batch: UI puslapio statusus užkrauna iš cache be fetch į tikslą.
+- PRIDĖTA: greičio rodymas (kiek realių fetch'ų per minutę) UI.
+- PRIDĖTA: iki 3 lygiagrečių užklausų į tikslinę svetainę (ThreadPoolExecutor + semaphore).
+"""
+
 import re
 import random
 import time
@@ -9,6 +28,8 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime, timezone
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, request, jsonify, Response
 import requests
@@ -17,10 +38,6 @@ from bs4 import BeautifulSoup
 # =========================
 # Konfigūracija (DEFAULT)
 # =========================
-# Nuo šiol intervalas NĖRA “hardcode”:
-# - default yra čia
-# - bet realiai jis gali būti pakeistas per UI (POST /api/range)
-# - ir išsisaugo į aruodas_state.json (persist)
 DEFAULT_START_NUM = 3000001
 DEFAULT_END_NUM = 3000033
 DEFAULT_STEP = 2  # tik nelyginiai -> STEP=2
@@ -32,16 +49,36 @@ STEP = DEFAULT_STEP
 # Apsauga nuo per didelio intervalo (UI gali pasirinkti bet ką)
 MAX_RANGE_ITEMS = int(os.getenv("MAX_RANGE_ITEMS", "120000"))
 
-# Keičiamas rate limit (per UI mygtukus)
-MIN_INTERVAL_SECONDS = 2.0   # default
+# Maksimalus batch dydis (kiek ID galima paduoti į /api/check_batch vienu kartu)
+# PADIDINTA iki 1000 pagal prašymą (galima overridinti per env).
+MAX_BATCH_IDS = int(os.getenv("MAX_BATCH_IDS", "1000"))
 
-# Jitter padarom proporcingą MIN_INTERVAL_SECONDS,
-# kad pasirinkus 0.1s / 0.2s realus intervalas nebūtų ~0.3–1.0s.
-JITTER_FRAC = (0.05, 0.25)  # 10%..40% nuo MIN_INTERVAL_SECONDS
-JITTER_SECONDS = (MIN_INTERVAL_SECONDS * JITTER_FRAC[0], MIN_INTERVAL_SECONDS * JITTER_FRAC[1])
+# Cache batch (be fetch į tikslą) – galima didesnė, bet UI paprastai naudos iki 1000.
+MAX_CACHE_BATCH_IDS = int(os.getenv("MAX_CACHE_BATCH_IDS", str(max(2000, MAX_BATCH_IDS))))
+
+# PRIDĖTA: tikslinės svetainės lygiagretumas (kiek max vienu metu fetch'inti į aruodas.lt)
+TARGET_CONCURRENCY = int(os.getenv("TARGET_CONCURRENCY", "10"))
+if TARGET_CONCURRENCY < 1:
+    TARGET_CONCURRENCY = 1
+# Safety cap – jei kas nors per env uždėtų nesąmoningai didelį skaičių.
+if TARGET_CONCURRENCY > 10:
+    TARGET_CONCURRENCY = 10
+
+# Keičiamas rate limit (per UI mygtukus)
+MIN_INTERVAL_SECONDS = 2.0  # default
+
+# Jitter: sumažintas, proporcingas, su lubomis (kad nebedominuotų prie 0.02/0.05).
+JITTER_FRAC = (0.02, 0.15)         # 2%..15% nuo MIN_INTERVAL_SECONDS
+JITTER_CAP_SECONDS = (0.02, 0.15)  # absoliučios lubos sekundėmis
+
+# Pradinė reikšmė (vėliau perskaičiuojama per recompute_jitter())
+JITTER_SECONDS = (
+    min(JITTER_CAP_SECONDS[0], MIN_INTERVAL_SECONDS * JITTER_FRAC[0]),
+    min(JITTER_CAP_SECONDS[1], MIN_INTERVAL_SECONDS * JITTER_FRAC[1]),
+)
 
 # UI mygtukai
-ALLOWED_RATE_LIMITS = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+ALLOWED_RATE_LIMITS = [0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -50,8 +87,6 @@ USER_AGENT = (
 )
 
 # Persistencijos failas:
-# - Lokaliai: paliekam šalia skripto
-# - Render.com: rekomenduojama mount'inti diską (pvz. /var/data) ir nustatyti STATE_DIR=/var/data
 DEFAULT_STATE_FILE = Path(__file__).with_name("aruodas_state.json")
 STATE_FILE_ENV = (os.getenv("STATE_FILE") or "").strip()
 STATE_DIR_ENV = (os.getenv("STATE_DIR") or "").strip()
@@ -63,29 +98,53 @@ elif STATE_DIR_ENV:
 else:
     STATE_FILE = DEFAULT_STATE_FILE
 
-# =========================
-# HTTP sesija
-# =========================
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "lt-LT,lt;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate",  # requests automatiškai išpakuoja gzip/deflate
-    "Connection": "keep-alive",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
-})
+# Persistencijos optimizacija: nerašyti į diską po kiekvieno ID.
+STATE_SAVE_MIN_INTERVAL_SECONDS = float(os.getenv("STATE_SAVE_MIN_INTERVAL_SECONDS", "5"))
+STATE_SAVE_EVERY_N = int(os.getenv("STATE_SAVE_EVERY_N", "50"))
+_last_state_save_mono = 0.0
+_dirty_since_save = 0
 
+# =========================
+# HTTP / concurrency
+# =========================
 _last_request_at = 0.0
 _rate_lock = threading.Lock()
 
-# Vienu metu leidžiam tik vieną "fetch" – saugiau Session'ui ir rate limit'ui
-FETCH_LOCK = threading.Lock()
+# PRIDĖTA: max 3 (ar TARGET_CONCURRENCY) vienu metu fetch į tikslą
+TARGET_SEM = threading.BoundedSemaphore(TARGET_CONCURRENCY)
+
+# PRIDĖTA: executor, kuris vykdo fetch'us lygiagrečiai
+EXECUTOR = ThreadPoolExecutor(max_workers=TARGET_CONCURRENCY)
+
+# Thread-local Session (requests.Session nėra idealu share'inti tarp thread'ų)
+_thread_local = threading.local()
+
+_SESSION_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "lt-LT,lt;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+def get_session() -> requests.Session:
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update(_SESSION_HEADERS)
+        _thread_local.session = s
+    return s
 
 # Cache atmintyje
-CACHE = {}        # id -> parsed result (be raw_html)
-RAW_CACHE = {}    # id -> raw_html (tik tiems, kuriuos tikrinai; NEPERSISTINAM)
+CACHE = {}  # id -> parsed result (be raw_html)
+
+# RAW_CACHE: LRU, kad nešautų į RAM, kai tikrini daug ID
+RAW_CACHE = OrderedDict()  # id -> raw_html (tik tiems, kuriuos tikrinai; NEPERSISTINAM)
+RAW_CACHE_MAX_ITEMS = int(os.getenv("RAW_CACHE_MAX_ITEMS", "200"))
+RAW_CACHE_MAX_BYTES = int(os.getenv("RAW_CACHE_MAX_BYTES", "500000"))
+
 CACHE_LOCK = threading.Lock()
 
 NOT_FOUND_MARKERS = [
@@ -189,7 +248,50 @@ def parse_range_value(v) -> int:
     raise ValueError("Netinkamas start/end formatas. Naudok skaičių (pvz 3000001) arba ID (pvz 1-3000001).")
 
 
+def _safe_float(x, default: float) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def recompute_jitter():
+    """Jitter = procentas nuo MIN_INTERVAL, bet su absoliučiom lubom (sekundėmis)."""
+    global JITTER_SECONDS
+
+    mi = float(MIN_INTERVAL_SECONDS)
+
+    jmin = min(float(JITTER_CAP_SECONDS[0]), mi * float(JITTER_FRAC[0]))
+    jmax = min(float(JITTER_CAP_SECONDS[1]), mi * float(JITTER_FRAC[1]))
+
+    if jmin < 0:
+        jmin = 0.0
+    if jmax < jmin:
+        jmax = jmin
+
+    JITTER_SECONDS = (jmin, jmax)
+
+
+def is_allowed_rate(x: float) -> bool:
+    """Tolerantiškas float palyginimas."""
+    try:
+        xf = float(x)
+    except Exception:
+        return False
+    return any(abs(xf - r) < 1e-9 for r in ALLOWED_RATE_LIMITS)
+
+
+def snap_rate(x: float) -> float:
+    """Prikabina prie artimiausios leidžiamos reikšmės (saugesnis float atvejais)."""
+    xf = float(x)
+    return min(ALLOWED_RATE_LIMITS, key=lambda r: abs(r - xf))
+
+
 def rate_limit():
+    """Globalus rate-limit (bendras visiems thread'ams).
+    Konkurencija leidžia turėti iki TARGET_CONCURRENCY inflight request'ų,
+    bet startai vis tiek ribojami MIN_INTERVAL_SECONDS.
+    """
     global _last_request_at
     with _rate_lock:
         now = time.monotonic()
@@ -336,12 +438,16 @@ def parse_html(html_text: str, final_url: str = "", http_status: int | None = No
 
 
 def fetch_and_parse(id_str: str) -> tuple[dict, str]:
+    """Fetch + parse vienam ID.
+    PRIDĖTA: leidžia iki TARGET_CONCURRENCY paralelinių fetch'ų (TARGET_SEM).
+    """
     url = f"https://www.aruodas.lt/{id_str}/"
 
-    # Vienu metu tik 1 requestas (apsauga nuo paralelių)
-    with FETCH_LOCK:
+    # max TARGET_CONCURRENCY inflight request'ų į tikslą
+    with TARGET_SEM:
         rate_limit()
-        r = SESSION.get(url, timeout=25, allow_redirects=True)
+        session = get_session()
+        r = session.get(url, timeout=25, allow_redirects=True)
 
     if not r.encoding:
         r.encoding = "utf-8"
@@ -358,28 +464,23 @@ def fetch_and_parse(id_str: str) -> tuple[dict, str]:
     return out, html_text
 
 
+def _raw_cache_put_locked(id_str: str, raw_html: str):
+    """LRU raw cache – kad RAM nesprogtų tikrinant tūkstančius ID."""
+    if RAW_CACHE_MAX_ITEMS <= 0:
+        return
+    RAW_CACHE[id_str] = (raw_html or "")[:RAW_CACHE_MAX_BYTES]
+    RAW_CACHE.move_to_end(id_str)
+    while len(RAW_CACHE) > RAW_CACHE_MAX_ITEMS:
+        RAW_CACHE.popitem(last=False)
+
+
 # =========================
 # Persistencija (istorija)
 # =========================
-def _safe_float(x, default: float) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def recompute_jitter():
-    """Perskaičiuoja jitter pagal esamą MIN_INTERVAL_SECONDS."""
-    global JITTER_SECONDS
-    JITTER_SECONDS = (
-        float(MIN_INTERVAL_SECONDS) * float(JITTER_FRAC[0]),
-        float(MIN_INTERVAL_SECONDS) * float(JITTER_FRAC[1]),
-    )
-
-
 def load_state_from_disk():
     """Užkrauna CACHE + config (rate limit) + range iš aruodas_state.json, jei yra."""
     global MIN_INTERVAL_SECONDS, START_NUM, END_NUM, STEP
+    global _last_state_save_mono, _dirty_since_save
 
     if not STATE_FILE.exists():
         return
@@ -392,8 +493,8 @@ def load_state_from_disk():
 
     cfg = (data or {}).get("config") or {}
     min_int = _safe_float(cfg.get("min_interval"), MIN_INTERVAL_SECONDS)
-    if min_int in ALLOWED_RATE_LIMITS:
-        MIN_INTERVAL_SECONDS = min_int
+    if is_allowed_rate(min_int):
+        MIN_INTERVAL_SECONDS = snap_rate(min_int)
         recompute_jitter()
 
     rng = (data or {}).get("range") or {}
@@ -404,16 +505,18 @@ def load_state_from_disk():
         start, end, step = normalize_range(start, end, step)
         START_NUM, END_NUM, STEP = start, end, step
     except Exception:
-        # jei range sugadintas – paliekam default/ankstesnį
         pass
 
     cached = (data or {}).get("cache") or {}
     if isinstance(cached, dict):
         with CACHE_LOCK:
-            # paliekam tik dict įrašus
             for k, v in cached.items():
                 if isinstance(k, str) and isinstance(v, dict) and "id" in v:
                     CACHE[k] = v
+
+    # reset "dirty" state po load
+    _last_state_save_mono = time.monotonic()
+    _dirty_since_save = 0
 
 
 def save_state_to_disk_locked():
@@ -440,7 +543,6 @@ def save_state_to_disk_locked():
             json.dump(payload, f, ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_FILE)
     except Exception:
-        # jei nepavyko – tyliai (nenorim crash)
         try:
             if tmp.exists():
                 tmp.unlink()
@@ -448,16 +550,89 @@ def save_state_to_disk_locked():
             pass
 
 
-def get_cached_items_for_current_range_locked():
-    """Grąžina list'ą su cache įrašais tik iš esamo intervalo (CALL ONLY UNDER CACHE_LOCK)."""
-    items = []
+def mark_state_dirty_locked(force: bool = False):
+    """Throttle disk writes (CALL ONLY UNDER CACHE_LOCK)."""
+    global _dirty_since_save, _last_state_save_mono
+
+    _dirty_since_save += 1
+    if force:
+        save_state_to_disk_locked()
+        _dirty_since_save = 0
+        _last_state_save_mono = time.monotonic()
+        return
+
+    now = time.monotonic()
+    if _dirty_since_save >= STATE_SAVE_EVERY_N or (now - _last_state_save_mono) >= STATE_SAVE_MIN_INTERVAL_SECONDS:
+        save_state_to_disk_locked()
+        _dirty_since_save = 0
+        _last_state_save_mono = now
+
+
+def _iter_cached_in_current_range_locked():
     for id_str, entry in CACHE.items():
         try:
             n = id_num(id_str)
             if in_range_and_odd(n):
-                items.append(entry)
+                yield id_str, entry
         except Exception:
             continue
+
+
+def get_cached_ids_for_current_range_locked() -> list[str]:
+    ids = []
+    for id_str, _ in _iter_cached_in_current_range_locked():
+        ids.append(id_str)
+    return ids
+
+
+def get_cached_stats_for_current_range_locked() -> dict:
+    stats = {
+        "checked": 0,
+        "found": 0,
+        "not_found": 0,
+        "challenge": 0,
+        "error": 0,
+        "bad_total": 0,
+    }
+    for _, entry in _iter_cached_in_current_range_locked():
+        stats["checked"] += 1
+        st = (entry or {}).get("status")
+        sug = (entry or {}).get("sugiharos_found") is True
+        if st == "FOUND" or sug:
+            stats["found"] += 1
+        if st == "NOT_FOUND":
+            stats["not_found"] += 1
+        elif st == "CHALLENGE":
+            stats["challenge"] += 1
+        elif st == "ERROR":
+            stats["error"] += 1
+
+    stats["bad_total"] = stats["not_found"] + stats["challenge"] + stats["error"]
+    return stats
+
+
+def get_cached_items_for_current_range_locked(mode: str = "all") -> list[dict]:
+    mode = (mode or "all").strip().lower()
+    items = []
+
+    for _, entry in _iter_cached_in_current_range_locked():
+        if not isinstance(entry, dict):
+            continue
+
+        st = entry.get("status")
+        sug = entry.get("sugiharos_found") is True
+
+        if mode == "none":
+            continue
+        if mode == "found":
+            if st == "FOUND" or sug:
+                items.append(entry)
+        elif mode == "bad":
+            if st in ("ERROR", "CHALLENGE", "NOT_FOUND"):
+                items.append(entry)
+        else:
+            items.append(entry)
+
     return items
 
 
@@ -478,7 +653,7 @@ INDEX_HTML = r"""<!doctype html>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
     .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom: 12px; }
-    input[type="text"], input[type="number"] { padding: 6px 8px; font-size: 14px; }
+    input[type="text"], input[type="number"], select { padding: 6px 8px; font-size: 14px; }
     input[type="text"] { width: 170px; }
     input[type="number"] { width: 140px; }
     button { padding: 7px 10px; font-size: 14px; cursor:pointer; }
@@ -497,7 +672,7 @@ INDEX_HTML = r"""<!doctype html>
     tr.unknown { background: #fbfbfb; }
     a { color: inherit; }
     .status { font-weight: 700; }
-    .hit { color: #0b63d1; font-weight: 700; } /* sugiharos mėlynai */
+    .hit { color: #0b63d1; font-weight: 700; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .note { color:#444; word-break: break-word; }
     .pill { display:inline-block; padding:2px 6px; border:1px solid #ccc; border-radius:999px; font-size:12px; background:#fff; }
@@ -508,11 +683,16 @@ INDEX_HTML = r"""<!doctype html>
     .rate-btn.active { border-color: #111; font-weight: 700; }
     #btnAutoToggle { border-radius: 10px; }
     #btnAutoToggle.running { font-weight: 800; }
-    .sep { width: 100%; height: 1px; background: #eee; margin: 4px 0; }
+    .warn { background:#fff4db; border:1px solid #f0d28a; padding:10px; border-radius:8px; }
   </style>
 </head>
 <body>
   <h2 style="margin:0 0 6px 0;">Aruodas ID tikrintuvas</h2>
+
+  <div class="warn" style="margin: 8px 0 12px 0;">
+    <b>⚠️ ĮSPĖJIMAS:</b> tik testavimui/eksperimentams. <b>Nenaudoti produkcinėje aplinkoje.</b>
+    <div class="muted" style="margin-top:4px;">Pastaba: turi iki <b>__CONC__</b> lygiagrečių užklausų į tikslą (su global rate-limit).</div>
+  </div>
 
   <div class="bar">
     <span class="pill" id="rangePill">ID intervalas: <b class="mono" id="pillStart">1-__START__</b> … <b class="mono" id="pillEnd">1-__END__</b> (tik nelyginiai)</span>
@@ -520,25 +700,44 @@ INDEX_HTML = r"""<!doctype html>
     <span class="pill">User-Agent: <span class="mono">__UA__</span></span>
     <span class="pill" id="ratePill">Rate limit: min <b class="mono" id="rateVal">__MIN__</b>s + jitter</span>
     <span class="pill" id="autoPill">Auto: OFF</span>
+    <span class="pill" id="speedPill">Greitis: <b class="mono" id="speedVal">0</b>/min</span>
   </div>
 
   <div class="bar">
-    <span class="muted">Nustatyk ID intervalą (galima keisti jau pasikrovus puslapiui):</span>
+    <span class="muted">Nustatyk ID intervalą:</span>
     <input id="rangeStart" type="number" step="1" value="__START__" />
     <input id="rangeEnd" type="number" step="1" value="__END__" />
     <button id="btnGenerate">Generuoti sąrašą</button>
-    <small class="muted">Pastaba: tik nelyginiai, STEP=2. Jei įvesi lyginį – serveris automatiškai pakoreguos į nelyginį.</small>
+    <small class="muted">Tik nelyginiai, STEP=2. Jei įvesi lyginį – serveris pakoreguos į nelyginį.</small>
   </div>
 
   <div class="bar">
-    <span class="muted">Rate limit pasirinkimas:</span>
+    <span class="muted">Rate limit:</span>
+    <button class="rate-btn" data-rate="0.02">0.02s</button>
     <button class="rate-btn" data-rate="0.05">0.05s</button>
     <button class="rate-btn" data-rate="0.1">0.1s</button>
     <button class="rate-btn" data-rate="0.2">0.2s</button>
     <button class="rate-btn" data-rate="0.5">0.5s</button>
     <button class="rate-btn" data-rate="1">1s</button>
     <button class="rate-btn" data-rate="2">2s</button>
-    <small class="muted">Pasirinkimas keičia serverio limitą ir išsisaugo (persist).</small>
+    <small class="muted">Keičia serverio limitą ir išsisaugo (persist).</small>
+  </div>
+
+  <div class="bar">
+    <span class="muted">Auto batch (IDs per API call):</span>
+    <select id="batchSize">
+      <option value="1">1</option>
+      <option value="5">5</option>
+      <option value="10">10</option>
+      <option value="20">20</option>
+      <option value="50" selected>50</option>
+      <option value="100">100</option>
+      <option value="200">200</option>
+      <option value="250">250</option>
+      <option value="500">500</option>
+      <option value="1000">1000</option>
+    </select>
+    <small class="muted">Tai nėra lygiagretūs connectionai UI pusėje – serveris pats vykdo iki __CONC__ fetch'ų į tikslą.</small>
   </div>
 
   <div class="bar">
@@ -547,12 +746,12 @@ INDEX_HTML = r"""<!doctype html>
     <button id="btnRandom">Atsitiktinis ID</button>
     <button id="btnForce">Tikrinti (force)</button>
     <button id="btnAutoToggle">▶ Auto (OFF)</button>
-    <small class="muted">Auto režimas eina per visus dar netikrintus ID. Sustos, jei gaus <b>ERROR</b>.</small>
+    <small class="muted">Auto eina per netikrintus ID. Sustos, jei gaus <b>ERROR</b>.</small>
   </div>
 
   <div class="grid">
     <div>
-      <h3 style="margin: 8px 0;">✅ Rasti skelbimai (FOUND)</h3>
+      <h3 style="margin: 8px 0;">✅ Rasti skelbimai (FOUND arba sugiharos hit)</h3>
       <table>
         <thead>
           <tr>
@@ -565,18 +764,42 @@ INDEX_HTML = r"""<!doctype html>
         </thead>
         <tbody id="foundBody"></tbody>
       </table>
-      <div class="muted" style="margin-top:6px;">Rūšiuojama automatiškai (naujausi viršuje).</div>
+      <div class="muted" style="margin-top:6px;">Rūšiuojama (naujausi viršuje).</div>
     </div>
 
     <div>
-      <h3 style="margin: 8px 0;">📋 Visi ID</h3>
+      <h3 style="margin: 8px 0;">📋 Visi ID (puslapiais)</h3>
+
+      <div class="bar">
+        <span class="muted">Puslapis:</span>
+        <button id="btnPrevPage">◀</button>
+        <span class="pill mono" id="pagePill">—</span>
+        <button id="btnNextPage">▶</button>
+
+        <span class="muted">Eilutės/pusl.:</span>
+        <select id="pageSize">
+          <option value="100">100</option>
+          <option value="250">250</option>
+          <option value="500" selected>500</option>
+          <option value="1000">1000</option>
+        </select>
+
+        <span class="muted">Šokti į ID:</span>
+        <input id="jumpTo" type="text" value="1-__START__" style="width:170px;" />
+        <button id="btnJump">Eiti</button>
+
+        <small class="muted">Dideliems intervalams čia rodoma tik dalis – nebekuriama 50k+ eilučių DOM’e.</small>
+      </div>
+
       <div class="bar">
         <input id="filter" type="text" placeholder="Filtras (pvz. 3123)" />
         <button id="btnClearFilter">Valyti filtrą</button>
         <button id="btnShowOnlyBad">Rodyti tik raudonus/oranžinius</button>
         <button id="btnShowAll">Rodyti visus</button>
       </div>
-      <small class="muted">Pastaba: ERROR viršuje, po to CHALLENGE, po to NOT_FOUND (raudoni).</small>
+
+      <small class="muted">Pastaba: filtras taikomas tik dabartiniam puslapiui.</small>
+
       <table>
         <thead>
           <tr>
@@ -622,8 +845,51 @@ let statePromise = null;
 // Patikrintų ID rinkinys (kad auto praleistų jau tikrintus)
 const checkedIds = new Set();
 
+// Lokalus rezultato cache (tik tai, ką UI jau parsisiuntė iš serverio)
+const resultsMap = new Map(); // id -> data
+
+// ===== Greičio skaičiavimas (checks per minute) =====
+// Skaičiuojam tik realius fetch į aruodas.lt: data.from_cache === false
+const speedWindow = []; // timestamps (ms)
+function recordSpeed(data){
+  if(data && data.from_cache === false){
+    const now = Date.now();
+    speedWindow.push(now);
+    while(speedWindow.length && speedWindow[0] < now - 60000){
+      speedWindow.shift();
+    }
+  }
+}
+function updateSpeedUi(){
+  const now = Date.now();
+  while(speedWindow.length && speedWindow[0] < now - 60000){
+    speedWindow.shift();
+  }
+  const el = document.getElementById("speedVal");
+  if(el) el.textContent = String(speedWindow.length);
+}
+setInterval(updateSpeedUi, 1000);
+
+// Auto batch dydis (IDs per API call)
+const AUTO_BATCH_OPTIONS = [1,5,10,20,50,100,200,250,500,1000];
+let AUTO_BATCH_SIZE = parseInt(localStorage.getItem("autoBatchSize") || "50", 10);
+if(!Number.isFinite(AUTO_BATCH_SIZE) || AUTO_BATCH_SIZE <= 0) AUTO_BATCH_SIZE = 50;
+if(!AUTO_BATCH_OPTIONS.includes(AUTO_BATCH_SIZE)) AUTO_BATCH_SIZE = 50;
+
+// „Visi ID“ puslapiavimas (kad nestrigtų naršyklė su 50k+ intervalais)
+const PAGE_SIZE_OPTIONS = [100,250,500,1000];
+let PAGE_SIZE = parseInt(localStorage.getItem("pageSize") || "500", 10);
+if(!Number.isFinite(PAGE_SIZE) || PAGE_SIZE <= 0) PAGE_SIZE = 500;
+if(!PAGE_SIZE_OPTIONS.includes(PAGE_SIZE)) PAGE_SIZE = 500;
+
+let currentPage = 0;
+let pageLoadToken = 0;
+
 function totalCount(){
   return Math.floor((END-START)/STEP)+1;
+}
+function totalPages(){
+  return Math.max(1, Math.ceil(totalCount()/PAGE_SIZE));
 }
 function checkedCount(){
   return checkedIds.size;
@@ -631,8 +897,9 @@ function checkedCount(){
 
 function numFromId(id) { const m=/^1-(\d+)$/.exec(id); return m?parseInt(m[1],10):NaN; }
 function makeId(n){ return "1-"+String(n); }
+
 function randomOddInRange(){
-  const count = Math.floor((END-START)/STEP)+1;
+  const count = totalCount();
   const k = Math.floor(Math.random()*count);
   return START + k*STEP;
 }
@@ -653,6 +920,14 @@ function statusLabel(s){
 }
 function safeText(x){ return (x===null||x===undefined)?"":String(x); }
 
+function updatePagePill(extraText=""){
+  const pill = document.getElementById("pagePill");
+  if(!pill) return;
+  const tp = totalPages();
+  const cur = Math.min(tp, Math.max(1, currentPage+1));
+  pill.textContent = `${cur}/${tp} (ps=${PAGE_SIZE})${extraText ? " – " + extraText : ""}`;
+}
+
 function updateRangeUi(){
   const rs = document.getElementById("rangeStart");
   const re = document.getElementById("rangeEnd");
@@ -668,7 +943,6 @@ function updateRangeUi(){
   const cv = document.getElementById("countVal");
   if(cv) cv.textContent = String(cnt);
 
-  // jei ID input tuščias arba ne intervale -> nustatom į pirmą
   const idInput = document.getElementById("idInput");
   if(idInput){
     const cur = idInput.value.trim();
@@ -678,12 +952,25 @@ function updateRangeUi(){
     }
   }
 
+  const jump = document.getElementById("jumpTo");
+  if(jump){
+    const cur = jump.value.trim();
+    const n = numFromId(cur);
+    if(!cur || !Number.isFinite(n) || n < START || n > END){
+      jump.value = makeId(START);
+    }
+  }
+
   autoNextNum = START;
+  currentPage = 0;
+  updatePagePill();
 }
 
 function buildAllRow(id){
   const tr=document.createElement("tr");
-  tr.dataset.id=id; tr.dataset.num=String(numFromId(id)); tr.className="unknown";
+  tr.dataset.id=id;
+  tr.dataset.num=String(numFromId(id));
+  tr.className="unknown";
   tr.innerHTML=`
     <td class="nowrap mono">
       <a href="https://www.aruodas.lt/${id}/" target="_blank" rel="noopener">${id}</a>
@@ -698,7 +985,10 @@ function buildAllRow(id){
 
 function buildFoundRow(id,data){
   const tr=document.createElement("tr");
-  tr.dataset.id=id; tr.dataset.num=String(numFromId(id)); tr.dataset.date=data.inserted_date||""; tr.className="found";
+  tr.dataset.id=id;
+  tr.dataset.num=String(numFromId(id));
+  tr.dataset.date=data.inserted_date||"";
+  tr.className="found";
 
   const pill = (data.status && data.status !== "FOUND")
     ? `<span class="pill mono">${statusLabel(data.status)}</span> `
@@ -731,7 +1021,7 @@ function updateAllRow(tr,data){
   }
 
   const idCell=tds[0];
-  if(!idCell.querySelector('a[href^="/raw"]')){
+  if(!idCell.querySelector('a[href^="/raw"]') && (data.status && data.status!=="—")){
     const div=document.createElement("div");
     div.innerHTML=`<a class="mono" href="/raw?id=${encodeURIComponent(data.id||tr.dataset.id)}" target="_blank" rel="noopener">raw</a>`;
     idCell.appendChild(div);
@@ -747,30 +1037,6 @@ function sortFoundTable(){
     return (parseInt(b.dataset.num,10)-parseInt(a.dataset.num,10));
   });
   for(const r of rows) body.appendChild(r);
-}
-
-// ERROR viršuje, tada CHALLENGE, tada NOT_FOUND
-function moveAllRowByStatus(tr, status){
-  const body = document.getElementById("allBody");
-  const cls = statusToClass(status);
-
-  const order = ["error", "challenge", "notfound"];
-  if(!order.includes(cls)) return;
-
-  const idx = order.indexOf(cls);
-  const beforeSet = new Set(order.slice(0, idx));
-  let insertAfter = null;
-
-  const rows = Array.from(body.querySelectorAll("tr"));
-  for(const r of rows){
-    if(beforeSet.has(r.className)) insertAfter = r;
-  }
-
-  if(insertAfter){
-    body.insertBefore(tr, insertAfter.nextSibling);
-  } else {
-    body.insertBefore(tr, body.firstChild);
-  }
 }
 
 function applyFilter(){
@@ -790,34 +1056,174 @@ function updateAutoPill(extraText=""){
   if(!pill) return;
   const base = autoRunning ? "Auto: ON" : "Auto: OFF";
   const prog = `${checkedCount()}/${totalCount()}`;
-  pill.textContent = `${base} (${prog})${extraText ? " – " + extraText : ""}`;
+  const bs = `batch=${AUTO_BATCH_SIZE}`;
+  pill.textContent = `${base} (${prog}, ${bs})${extraText ? " – " + extraText : ""}`;
 }
 
-function applyResultToUi(data){
-  const idNorm=data.id;
-  checkedIds.add(idNorm);
+function chunkArray(arr, size){
+  const out=[];
+  for(let i=0;i<arr.length;i+=size){
+    out.push(arr.slice(i,i+size));
+  }
+  return out;
+}
 
-  const allRow=document.querySelector(`#allBody tr[data-id="${CSS.escape(idNorm)}"]`);
+function pageIds(pageIndex){
+  const total = totalCount();
+  const startIndex = pageIndex * PAGE_SIZE;
+  const out = [];
 
-  // PATAISA: jei sugiharos rasta, laikom kaip "rastas" net jei CHALLENGE
-  const putToFound = (data.status === "FOUND") || (data.sugiharos_found === true);
+  for(let i=0;i<PAGE_SIZE;i++){
+    const idx = startIndex + i;
+    if(idx >= total) break;
+    const n = START + idx*STEP;
+    out.push(makeId(n));
+  }
+  return out;
+}
 
-  if(putToFound){
-    if(allRow) allRow.remove();
-    const existing=document.querySelector(`#foundBody tr[data-id="${CSS.escape(idNorm)}"]`);
-    if(existing) existing.remove();
-    document.getElementById("foundBody").appendChild(buildFoundRow(idNorm,data));
-    sortFoundTable();
-  } else {
-    if(allRow){
-      updateAllRow(allRow,data);
-      moveAllRowByStatus(allRow, data.status);
+function renderAllPage(){
+  const body=document.getElementById("allBody");
+  body.innerHTML = "";
+  const ids = pageIds(currentPage);
+  const frag=document.createDocumentFragment();
+
+  for(const id of ids){
+    const tr = buildAllRow(id);
+    const cached = resultsMap.get(id);
+    if(cached) updateAllRow(tr, cached);
+    frag.appendChild(tr);
+  }
+  body.appendChild(frag);
+
+  updatePagePill();
+  applyFilter();
+}
+
+async function fetchCacheBatch(ids){
+  let resp, data;
+  try{
+    resp = await fetch("/api/cache_batch", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ ids })
+    });
+    data = await resp.json();
+  } catch(err){
+    return [];
+  }
+
+  if(!resp || !resp.ok || !data || data.error){
+    return [];
+  }
+  return data.items || [];
+}
+
+async function loadCacheForVisiblePage(){
+  const token = ++pageLoadToken;
+  const ids = pageIds(currentPage);
+
+  // tik tie, kurie jau patikrinti (kad nerizikuotume fetch'int į tikslą)
+  const need = ids.filter(id => checkedIds.has(id) && !resultsMap.has(id));
+  if(!need.length){
+    updatePagePill();
+    return;
+  }
+
+  updatePagePill("kraunama…");
+
+  // chunk'inam, kad neperlenktume lazdos su payload
+  const chunks = chunkArray(need, 500);
+
+  for(const chunk of chunks){
+    if(token !== pageLoadToken) return;
+    const items = await fetchCacheBatch(chunk);
+    for(const item of items){
+      applyResultToUi(item, false);
     }
   }
 
+  sortFoundTable();
+  applyFilter();
   updateAutoPill();
+  updatePagePill();
 }
 
+function setPage(p){
+  const tp = totalPages();
+  currentPage = Math.max(0, Math.min(tp-1, p));
+  renderAllPage();
+  loadCacheForVisiblePage();
+}
+
+function jumpToId(idLike){
+  const s = (idLike||"").trim();
+  if(!s) return;
+
+  let n = NaN;
+  const m = /^1-(\d+)$/.exec(s);
+  if(m) n = parseInt(m[1],10);
+  else if(/^\d+$/.test(s)) n = parseInt(s,10);
+
+  if(!Number.isFinite(n)){
+    alert("Netinkamas ID / skaičius. Pvz: 1-3000001");
+    return;
+  }
+  if(n < START || n > END){
+    alert("ID ne intervale.");
+    return;
+  }
+  if(n % 2 === 0){
+    // automatiškai šokam į artimiausią nelyginį
+    n = n + 1;
+    if(n > END) n = n - 2;
+  }
+
+  const idx = Math.floor((n - START) / STEP);
+  const page = Math.floor(idx / PAGE_SIZE);
+  setPage(page);
+
+  // atnaujinam input
+  const jump = document.getElementById("jumpTo");
+  if(jump) jump.value = makeId(n);
+
+  // lengvas highlight (nebūtina, bet patogu)
+  setTimeout(()=>{
+    const id = makeId(n);
+    const row = document.querySelector(`#allBody tr[data-id="${CSS.escape(id)}"]`);
+    if(row){
+      row.style.outline = "2px solid #0b63d1";
+      setTimeout(()=>{ row.style.outline = ""; }, 1200);
+    }
+  }, 50);
+}
+
+// jei sugiharos rasta, laikom kaip "rastas" net jei CHALLENGE
+function applyResultToUi(data, doSort=true){
+  // greitis (tik realūs fetch'ai, ne cache)
+  recordSpeed(data);
+  updateSpeedUi();
+
+  const idNorm=data.id;
+  checkedIds.add(idNorm);
+  resultsMap.set(idNorm, data);
+
+  const putToFound = (data.status === "FOUND") || (data.sugiharos_found === true);
+
+  if(putToFound){
+    const existing=document.querySelector(`#foundBody tr[data-id="${CSS.escape(idNorm)}"]`);
+    if(existing) existing.remove();
+    document.getElementById("foundBody").appendChild(buildFoundRow(idNorm,data));
+    if(doSort) sortFoundTable();
+  }
+
+  const allRow=document.querySelector(`#allBody tr[data-id="${CSS.escape(idNorm)}"]`);
+  if(allRow){
+    updateAllRow(allRow, data);
+  }
+}
+
+// Single check async
 async function checkId(id, force=false, silent=false){
   let resp, data;
   try{
@@ -835,7 +1241,8 @@ async function checkId(id, force=false, silent=false){
       district: null,
       final_url: null,
       sugiharos_found: false,
-      sugiharos_snippet_html: null
+      sugiharos_snippet_html: null,
+      from_cache: false
     };
   }
 
@@ -844,86 +1251,75 @@ async function checkId(id, force=false, silent=false){
     if(!data.id) data.id = id;
     if(!data.status) data.status = "ERROR";
     if(!data.error) data.error = data.error || "Klaida tikrinant ID";
-    applyResultToUi(data);
+    if(data.from_cache === undefined) data.from_cache = false;
+    applyResultToUi(data, true);
     applyFilter();
+    updateAutoPill();
     if(!silent){
       alert(data.error || "Klaida tikrinant ID");
     }
     return data;
   }
 
-  applyResultToUi(data);
+  applyResultToUi(data, true);
   applyFilter();
+  updateAutoPill();
   return data;
 }
 
-function initAllTable(){
-  const body=document.getElementById("allBody");
-  body.innerHTML = "";
-  const frag=document.createDocumentFragment();
-  for(let n=START;n<=END;n+=STEP) frag.appendChild(buildAllRow(makeId(n)));
-  body.appendChild(frag);
-}
+// Batch check (mažiau API overhead)
+async function checkBatch(ids, force=false, silent=false, stopOnError=false){
+  let resp, data;
+  try{
+    resp = await fetch("/api/check_batch", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        ids: ids,
+        force: force ? 1 : 0,
+        stop_on_error: stopOnError ? 1 : 0
+      })
+    });
+    data = await resp.json();
+  } catch(err){
+    const msg = String(err);
+    if(!silent) alert(msg);
+    return [{
+      id: (ids && ids[0]) ? ids[0] : "1-0",
+      checked_at: new Date().toISOString(),
+      status: "ERROR",
+      error: msg,
+      http_status: null,
+      inserted_date: null,
+      city: null,
+      district: null,
+      final_url: null,
+      sugiharos_found: false,
+      sugiharos_snippet_html: null,
+      from_cache: false
+    }];
+  }
 
-// Persisted state + dynamic range užkrovimas
-async function reloadEverything(){
-  if(stateLoading && statePromise) return statePromise;
+  if(!resp || !resp.ok || !data || data.error){
+    const msg = (data && data.error) ? data.error : "Klaida tikrinant batch";
+    if(!silent) alert(msg);
+    return [{
+      id: (ids && ids[0]) ? ids[0] : "1-0",
+      checked_at: new Date().toISOString(),
+      status: "ERROR",
+      error: msg,
+      http_status: null,
+      inserted_date: null,
+      city: null,
+      district: null,
+      final_url: null,
+      sugiharos_found: false,
+      sugiharos_snippet_html: null,
+      from_cache: false
+    }];
+  }
 
-  stateLoading = true;
-  setControlsDisabled(true, !autoRunning); // auto išjungiam tik jei auto ne running
-  setAutoButtonUi();
-  updateAutoPill("kraunama…");
-
-  statePromise = (async()=>{
-    try{
-      // reset UI
-      checkedIds.clear();
-      document.getElementById("foundBody").innerHTML = "";
-      document.getElementById("allBody").innerHTML = "";
-
-      const resp = await fetch("/api/state");
-      const state = await resp.json();
-
-      const cfg = state.config || {};
-      if(cfg.min_interval !== undefined && cfg.min_interval !== null){
-        updateRateUi(cfg.min_interval);
-      }
-
-      const rng = state.range || {};
-      if(rng.start && rng.end && rng.step){
-        START = parseInt(rng.start,10);
-        END   = parseInt(rng.end,10);
-        STEP  = parseInt(rng.step,10);
-      }
-
-      updateRangeUi();
-      initAllTable();
-
-      const items = state.items || [];
-      for(const item of items){
-        applyResultToUi(item);
-      }
-
-      sortFoundTable();
-      applyFilter();
-      updateAutoPill();
-    } finally {
-      stateLoading = false;
-
-      if(autoRunning){
-        // Auto režime control'ai turi likti disabled, bet STOP turi veikti
-        setControlsDisabled(true, false);
-      } else {
-        // Normaliai viską atrakinti (įskaitant Auto)
-        setControlsDisabled(false, true);
-      }
-
-      setAutoButtonUi();
-      updateAutoPill();
-    }
-  })();
-
-  return statePromise;
+  return data.items || [];
 }
 
 function updateRateUi(minInterval){
@@ -967,8 +1363,6 @@ async function setRangeOnServer(startVal, endVal){
 
 // Auto UI / toggle
 function setControlsDisabled(disabled, disableAuto=false){
-  // auto mygtukas – kartais reikia išjungti (kai kraunam state / keičiam range),
-  // bet kai autoRunning=true – auto mygtukas turi likti aktyvus STOP'ui.
   const autoBtn = document.getElementById("btnAutoToggle");
   if(autoBtn){
     autoBtn.disabled = disableAuto ? disabled : false;
@@ -983,7 +1377,11 @@ function setControlsDisabled(disabled, disableAuto=false){
   document.querySelectorAll("button.rate-btn").forEach(b => b.disabled = disabled);
   document.querySelectorAll("button[data-action='check']").forEach(b => b.disabled = disabled);
 
-  ["filter","btnClearFilter","btnShowOnlyBad","btnShowAll","idInput","rangeStart","rangeEnd"].forEach(id=>{
+  [
+    "filter","btnClearFilter","btnShowOnlyBad","btnShowAll",
+    "idInput","rangeStart","rangeEnd","batchSize",
+    "btnPrevPage","btnNextPage","pageSize","jumpTo","btnJump"
+  ].forEach(id=>{
     const el = document.getElementById(id);
     if(el) el.disabled = disabled;
   });
@@ -996,26 +1394,27 @@ function setAutoButtonUi(){
   btn.textContent = autoRunning ? "⏸ Auto (STOP)" : "▶ Auto (OFF)";
 }
 
-// suranda kitą netikrintą ID, pradedant nuo fromNum (ir apsukant ratą)
-function findNextUnchecked(fromNum){
+// randa batch sąrašą netikrintų ID (iki limit), pradedant nuo fromNum
+function findNextUncheckedBatch(fromNum, limit){
   const total = totalCount();
   let n = fromNum;
+  const out = [];
 
-  for(let i=0;i<total;i++){
+  for(let i=0;i<total && out.length<limit;i++){
     if(n > END) n = START;
     const id = makeId(n);
     if(!checkedIds.has(id)){
-      return {id, n};
+      out.push({id, n});
     }
     n += STEP;
   }
-  return null;
+
+  return out.length ? out : null;
 }
 
 async function runAuto(){
   if(autoRunning) return;
 
-  // jei dar kraunam state – palaukiam (fix nuo “sustoja” bug’o)
   if(stateLoading && statePromise){
     await statePromise;
   }
@@ -1030,23 +1429,42 @@ async function runAuto(){
   let n = autoNextNum;
 
   while(autoRunning && !autoStopRequested){
-    const next = findNextUnchecked(n);
-    if(!next){
+    const batch = findNextUncheckedBatch(n, AUTO_BATCH_SIZE);
+    if(!batch){
       updateAutoPill("baigta (viskas patikrinta)");
       break;
     }
 
-    updateAutoPill(`tikrinamas ${next.id}`);
+    const ids = batch.map(x => x.id);
+    updateAutoPill(`tikrinama batch: ${ids[0]} … (${ids.length})`);
 
-    const res = await checkId(next.id, false, true);
+    const items = await checkBatch(ids, false, true, true);
 
-    // Sustabdom auto, jei gavom ERROR
-    if(!res || res.status === "ERROR" || res.error){
-      updateAutoPill(`SUSTABDYTA: ERROR ties ${next.id}`);
+    // pritaikom UI vienu kartu (be sort kiekvienam įrašui)
+    for(const item of items){
+      applyResultToUi(item, false);
+    }
+    sortFoundTable();
+    applyFilter();
+    updateAutoPill();
+
+    // jei batch'e gavom error – stop
+    const bad = items.find(it => (it && (it.status === "ERROR" || it.error)));
+    if(bad){
+      const bid = bad.id || (ids[0] || "");
+      updateAutoPill(`SUSTABDYTA: ERROR ties ${bid}`);
       break;
     }
 
-    n = next.n + STEP;
+    // pastumiam pointerį į sekantį po paskutinio apdoroto
+    // (serveris su stop_on_error grąžina prefix'ą, todėl čia logika lieka teisinga)
+    const processed = items.length;
+    if(processed <= 0){
+      updateAutoPill("SUSTABDYTA: tuščias batch atsakymas");
+      break;
+    }
+    const last = batch[Math.min(processed, batch.length) - 1];
+    n = last.n + STEP;
     autoNextNum = n;
 
     await new Promise(r => setTimeout(r, 30));
@@ -1066,6 +1484,81 @@ function stopAuto(){
   updateAutoPill("stabdoma…");
 }
 
+// Persisted state + dynamic range užkrovimas
+async function reloadEverything(){
+  if(stateLoading && statePromise) return statePromise;
+
+  stateLoading = true;
+  setControlsDisabled(true, !autoRunning);
+  setAutoButtonUi();
+  updateAutoPill("kraunama…");
+  updatePagePill("kraunama…");
+
+  statePromise = (async()=>{
+    try{
+      checkedIds.clear();
+      resultsMap.clear();
+      speedWindow.length = 0;
+      updateSpeedUi();
+
+      document.getElementById("foundBody").innerHTML = "";
+      document.getElementById("allBody").innerHTML = "";
+
+      // PAGRINDINĖ OPTIMIZACIJA: nekraunam visų item'ų, o tik FOUND (ir gaunam checked_ids).
+      const resp = await fetch("/api/state?items=found&include_ids=1");
+      const state = await resp.json();
+
+      const cfg = state.config || {};
+      if(cfg.min_interval !== undefined && cfg.min_interval !== null){
+        updateRateUi(cfg.min_interval);
+      }
+
+      const rng = state.range || {};
+      if(rng.start && rng.end && rng.step){
+        START = parseInt(rng.start,10);
+        END   = parseInt(rng.end,10);
+        STEP  = parseInt(rng.step,10);
+      }
+
+      // checked IDs (auto progresui + skip)
+      const ids = state.checked_ids || [];
+      for(const id of ids){
+        checkedIds.add(id);
+      }
+
+      updateRangeUi();
+
+      // FOUND items (rodoma kairėje)
+      const items = state.items || [];
+      for(const item of items){
+        applyResultToUi(item, false);
+      }
+      sortFoundTable();
+
+      // render pirmą puslapį ir užkraunam jo cache statusus (tik tiems ID, kurie jau tikrinti)
+      renderAllPage();
+      await loadCacheForVisiblePage();
+
+      applyFilter();
+      updateAutoPill();
+    } finally {
+      stateLoading = false;
+
+      if(autoRunning){
+        setControlsDisabled(true, false);
+      } else {
+        setControlsDisabled(false, true);
+      }
+
+      setAutoButtonUi();
+      updateAutoPill();
+      updatePagePill();
+    }
+  })();
+
+  return statePromise;
+}
+
 // Click handleriai
 document.addEventListener("click",async(e)=>{
   const btn=e.target.closest("button[data-action='check']");
@@ -1078,8 +1571,12 @@ document.addEventListener("click",async(e)=>{
   }
 });
 
-document.getElementById("btnCheck").addEventListener("click",async()=>{ await checkId(document.getElementById("idInput").value.trim(),false,false); });
-document.getElementById("btnForce").addEventListener("click",async()=>{ await checkId(document.getElementById("idInput").value.trim(),true,false); });
+document.getElementById("btnCheck").addEventListener("click",async()=>{
+  await checkId(document.getElementById("idInput").value.trim(),false,false);
+});
+document.getElementById("btnForce").addEventListener("click",async()=>{
+  await checkId(document.getElementById("idInput").value.trim(),true,false);
+});
 document.getElementById("btnRandom").addEventListener("click",async()=>{
   const id=makeId(randomOddInRange());
   document.getElementById("idInput").value=id;
@@ -1094,6 +1591,52 @@ document.getElementById("btnAutoToggle").addEventListener("click", async()=>{
   await runAuto();
 });
 
+// Batch size UI
+const batchSel = document.getElementById("batchSize");
+if(batchSel){
+  batchSel.value = String(AUTO_BATCH_SIZE);
+  batchSel.addEventListener("change", ()=>{
+    const v = parseInt(batchSel.value, 10);
+    if(Number.isFinite(v) && v > 0){
+      AUTO_BATCH_SIZE = v;
+      localStorage.setItem("autoBatchSize", String(v));
+      updateAutoPill();
+    }
+  });
+}
+
+// Page size UI
+const pageSel = document.getElementById("pageSize");
+if(pageSel){
+  pageSel.value = String(PAGE_SIZE);
+  pageSel.addEventListener("change", ()=>{
+    const v = parseInt(pageSel.value, 10);
+    if(Number.isFinite(v) && v > 0){
+      // išlaikom pirmo matomo ID indeksą, kad "nešokinėtų"
+      const firstIdx = currentPage * PAGE_SIZE;
+      PAGE_SIZE = v;
+      localStorage.setItem("pageSize", String(v));
+      const newPage = Math.floor(firstIdx / PAGE_SIZE);
+      setPage(newPage);
+    }
+  });
+}
+
+document.getElementById("btnPrevPage").addEventListener("click", ()=>{
+  setPage(currentPage - 1);
+});
+document.getElementById("btnNextPage").addEventListener("click", ()=>{
+  setPage(currentPage + 1);
+});
+document.getElementById("btnJump").addEventListener("click", ()=>{
+  jumpToId(document.getElementById("jumpTo").value.trim());
+});
+document.getElementById("jumpTo").addEventListener("keydown", (e)=>{
+  if(e.key === "Enter"){
+    jumpToId(document.getElementById("jumpTo").value.trim());
+  }
+});
+
 // Generuoti sąrašą pagal naują intervalą
 document.getElementById("btnGenerate").addEventListener("click", async()=>{
   if(autoRunning){
@@ -1101,13 +1644,11 @@ document.getElementById("btnGenerate").addEventListener("click", async()=>{
     return;
   }
 
-  // kad neliktų “race” – kol keičiam range ir kraunam state, išjungiam viską (įskaitant Auto)
   setControlsDisabled(true, true);
 
   const s = document.getElementById("rangeStart").value;
   const e = document.getElementById("rangeEnd").value;
 
-  // reset filter režimų (kad vartotojui būtų aišku, jog naujas sąrašas)
   document.getElementById("filter").value = "";
   showOnlyBad = false;
 
@@ -1117,14 +1658,23 @@ document.getElementById("btnGenerate").addEventListener("click", async()=>{
     return;
   }
 
-  // per naują užsikraunam state + naują range + atstatom lenteles
   await reloadEverything();
 });
 
 document.getElementById("filter").addEventListener("input",applyFilter);
-document.getElementById("btnClearFilter").addEventListener("click",()=>{ document.getElementById("filter").value=""; showOnlyBad=false; applyFilter(); });
-document.getElementById("btnShowOnlyBad").addEventListener("click",()=>{ showOnlyBad=true; applyFilter(); });
-document.getElementById("btnShowAll").addEventListener("click",()=>{ showOnlyBad=false; applyFilter(); });
+document.getElementById("btnClearFilter").addEventListener("click",()=>{
+  document.getElementById("filter").value="";
+  showOnlyBad=false;
+  applyFilter();
+});
+document.getElementById("btnShowOnlyBad").addEventListener("click",()=>{
+  showOnlyBad=true;
+  applyFilter();
+});
+document.getElementById("btnShowAll").addEventListener("click",()=>{
+  showOnlyBad=false;
+  applyFilter();
+});
 
 document.getElementById("btnDebugParse").addEventListener("click", async()=>{
   const html=document.getElementById("debugHtml").value;
@@ -1146,11 +1696,14 @@ document.getElementById("btnDebugParse").addEventListener("click", async()=>{
 applyFilter();
 updateAutoPill();
 setAutoButtonUi();
+updatePagePill();
+updateSpeedUi();
+
 statePromise = reloadEverything();
 </script>
-</body></html>
+</body>
+</html>
 """
-
 
 @app.get("/")
 def index():
@@ -1161,19 +1714,55 @@ def index():
         .replace("__STEP__", str(STEP))
         .replace("__UA__", html.escape(USER_AGENT))
         .replace("__MIN__", str(MIN_INTERVAL_SECONDS))
+        .replace("__CONC__", str(TARGET_CONCURRENCY))
     )
     return Response(html_page, mimetype="text/html; charset=utf-8")
 
 
 @app.get("/api/state")
 def api_state():
+    items_mode = (request.args.get("items") or "all").strip().lower()
+    if items_mode not in ("all", "found", "bad", "none"):
+        items_mode = "all"
+
+    include_ids = (request.args.get("include_ids", "1") != "0")
+
+    # optional slicing
+    try:
+        offset = int(request.args.get("offset", "0"))
+    except Exception:
+        offset = 0
+    try:
+        limit = int(request.args.get("limit", "0"))
+    except Exception:
+        limit = 0
+    if offset < 0:
+        offset = 0
+    if limit < 0:
+        limit = 0
+
     with CACHE_LOCK:
-        items = get_cached_items_for_current_range_locked()
+        stats = get_cached_stats_for_current_range_locked()
+
+        items = get_cached_items_for_current_range_locked(items_mode)
+        if offset:
+            items = items[offset:]
+        if limit:
+            items = items[:limit]
+
         cfg = {
             "min_interval": MIN_INTERVAL_SECONDS,
             "allowed_rates": ALLOWED_RATE_LIMITS,
             "state_file": str(STATE_FILE),
             "max_range_items": MAX_RANGE_ITEMS,
+            "max_batch_ids": MAX_BATCH_IDS,
+            "max_cache_batch_ids": MAX_CACHE_BATCH_IDS,
+            "target_concurrency": TARGET_CONCURRENCY,
+            "jitter_seconds": [float(JITTER_SECONDS[0]), float(JITTER_SECONDS[1])],
+            "raw_cache_max_items": RAW_CACHE_MAX_ITEMS,
+            "raw_cache_max_bytes": RAW_CACHE_MAX_BYTES,
+            "state_save_min_interval_seconds": STATE_SAVE_MIN_INTERVAL_SECONDS,
+            "state_save_every_n": STATE_SAVE_EVERY_N,
         }
         rng = {
             "start": START_NUM,
@@ -1181,7 +1770,43 @@ def api_state():
             "step": STEP,
             "count": range_count(START_NUM, END_NUM, STEP),
         }
-    return jsonify({"config": cfg, "range": rng, "items": items})
+
+        payload = {"config": cfg, "range": rng, "stats": stats, "items": items}
+        if include_ids:
+            payload["checked_ids"] = get_cached_ids_for_current_range_locked()
+
+    return jsonify(payload)
+
+
+@app.post("/api/cache_batch")
+def api_cache_batch():
+    """Gražina tik CACHE įrašus (be fetch į tikslą)."""
+    payload = request.get_json(silent=True) or {}
+    ids = payload.get("ids", None)
+
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "ids turi būti sąrašas (pvz. {ids:[\"1-3000001\", ...]})."}), 400
+    if len(ids) > MAX_CACHE_BATCH_IDS:
+        return jsonify({"error": f"Per didelis cache batch: {len(ids)}. Max: {MAX_CACHE_BATCH_IDS}."}), 400
+
+    norm_ids: list[str] = []
+    try:
+        for x in ids:
+            id_str = normalize_id(str(x))
+            norm_ids.append(id_str)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    with CACHE_LOCK:
+        out = []
+        for id_str in norm_ids:
+            entry = CACHE.get(id_str)
+            if isinstance(entry, dict):
+                d = dict(entry)
+                d["from_cache"] = True
+                out.append(d)
+
+    return jsonify({"items": out, "count": len(out)})
 
 
 @app.get("/api/config")
@@ -1189,6 +1814,8 @@ def api_config_get():
     return jsonify({
         "min_interval": MIN_INTERVAL_SECONDS,
         "allowed_rates": ALLOWED_RATE_LIMITS,
+        "jitter_seconds": [float(JITTER_SECONDS[0]), float(JITTER_SECONDS[1])],
+        "target_concurrency": TARGET_CONCURRENCY,
     })
 
 
@@ -1200,16 +1827,22 @@ def api_config_set():
     try:
         f = float(val)
     except Exception:
-        return jsonify({"error": "min_interval turi būti skaičius (0.1 / 0.2 / 0.5 / 1 / 2)."}), 400
+        return jsonify({"error": "min_interval turi būti skaičius (0.02 / 0.05 / 0.1 / 0.2 / 0.5 / 1 / 2)."}), 400
 
-    if f not in ALLOWED_RATE_LIMITS:
+    if not is_allowed_rate(f):
         return jsonify({"error": f"Leidžiamos reikšmės: {ALLOWED_RATE_LIMITS}"}), 400
 
-    MIN_INTERVAL_SECONDS = f
+    MIN_INTERVAL_SECONDS = snap_rate(f)
     recompute_jitter()
+
     with CACHE_LOCK:
-        save_state_to_disk_locked()
-    return jsonify({"min_interval": MIN_INTERVAL_SECONDS})
+        mark_state_dirty_locked(force=True)
+
+    return jsonify({
+        "min_interval": MIN_INTERVAL_SECONDS,
+        "jitter_seconds": [float(JITTER_SECONDS[0]), float(JITTER_SECONDS[1])],
+        "target_concurrency": TARGET_CONCURRENCY,
+    })
 
 
 @app.get("/api/range")
@@ -1242,7 +1875,7 @@ def api_range_set():
     START_NUM, END_NUM, STEP = start, end, step
 
     with CACHE_LOCK:
-        save_state_to_disk_locked()
+        mark_state_dirty_locked(force=True)
 
     return jsonify({
         "range": {
@@ -1269,15 +1902,20 @@ def api_check():
 
     with CACHE_LOCK:
         if not force and id_str in CACHE:
-            return jsonify(CACHE[id_str])
+            d = dict(CACHE[id_str])
+            d["from_cache"] = True
+            return jsonify(d)
 
     try:
         out, raw_html = fetch_and_parse(id_str)
         with CACHE_LOCK:
             CACHE[id_str] = out
-            RAW_CACHE[id_str] = raw_html[:500_000]  # apsauga nuo per didelės atminties
-            save_state_to_disk_locked()
-        return jsonify(out)
+            _raw_cache_put_locked(id_str, raw_html)
+            mark_state_dirty_locked(force=False)
+
+        d = dict(out)
+        d["from_cache"] = False
+        return jsonify(d)
     except Exception as e:
         err = {
             "id": id_str,
@@ -1294,8 +1932,137 @@ def api_check():
         }
         with CACHE_LOCK:
             CACHE[id_str] = err
-            save_state_to_disk_locked()
-        return jsonify(err), 200
+            mark_state_dirty_locked(force=False)
+
+        d = dict(err)
+        d["from_cache"] = False
+        return jsonify(d), 200
+
+
+@app.post("/api/check_batch")
+def api_check_batch():
+    payload = request.get_json(silent=True) or {}
+    ids = payload.get("ids", None)
+    force = str(payload.get("force", "0")).lower() in ("1", "true", "yes", "y")
+    stop_on_error = str(payload.get("stop_on_error", "0")).lower() in ("1", "true", "yes", "y")
+
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "ids turi būti sąrašas (pvz. {ids:[\"1-3000001\", ...]})."}), 400
+
+    if len(ids) > MAX_BATCH_IDS:
+        return jsonify({"error": f"Per didelis batch: {len(ids)}. Max: {MAX_BATCH_IDS}."}), 400
+
+    # normalizuojam ir tikrinam
+    norm_ids: list[str] = []
+    try:
+        for x in ids:
+            id_str = normalize_id(str(x))
+            n = id_num(id_str)
+            if not in_range_and_odd(n):
+                raise ValueError(f"ID ne intervale arba ne nelyginis: {id_str}")
+            norm_ids.append(id_str)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    results: list[dict] = []
+    dirty = False
+    stopped_early = False
+
+    # ===== PRIDĖTA: pipeline su iki TARGET_CONCURRENCY lygiagrečių fetch'ų =====
+    futures: dict[int, object] = {}
+    next_to_submit = 0
+
+    def submit_until_full():
+        nonlocal next_to_submit
+        while next_to_submit < len(norm_ids) and len(futures) < TARGET_CONCURRENCY:
+            id_str2 = norm_ids[next_to_submit]
+
+            if not force:
+                with CACHE_LOCK:
+                    cached2 = CACHE.get(id_str2)
+                if cached2 is not None:
+                    # cache hit – nesiunčiam future, bus grąžinta kai ateis eilė
+                    next_to_submit += 1
+                    continue
+
+            futures[next_to_submit] = EXECUTOR.submit(fetch_and_parse, id_str2)
+            next_to_submit += 1
+
+    submit_until_full()
+
+    for i, id_str in enumerate(norm_ids):
+        # cache hit – grąžinam iš karto (kaip seniau)
+        if not force:
+            with CACHE_LOCK:
+                cached = CACHE.get(id_str)
+            if cached is not None:
+                d = dict(cached)
+                d["from_cache"] = True
+                results.append(d)
+                submit_until_full()
+                continue
+
+        # reikia fetch
+        fut = futures.pop(i, None)
+        if fut is None:
+            # jei netyčia nebuvo užsakyta (pvz daug cache skip'ų) – užsakome dabar
+            fut = EXECUTOR.submit(fetch_and_parse, id_str)
+
+        try:
+            out, raw_html = fut.result()
+            with CACHE_LOCK:
+                CACHE[id_str] = out
+                _raw_cache_put_locked(id_str, raw_html)
+            dirty = True
+
+            d = dict(out)
+            d["from_cache"] = False
+            results.append(d)
+
+        except Exception as e:
+            err = {
+                "id": id_str,
+                "checked_at": now_iso(),
+                "status": "ERROR",
+                "error": str(e),
+                "http_status": None,
+                "inserted_date": None,
+                "city": None,
+                "district": None,
+                "final_url": None,
+                "sugiharos_found": False,
+                "sugiharos_snippet_html": None,
+            }
+            with CACHE_LOCK:
+                CACHE[id_str] = err
+            dirty = True
+
+            d = dict(err)
+            d["from_cache"] = False
+            results.append(d)
+
+            if stop_on_error:
+                stopped_early = True
+                # cancel likusius (best effort)
+                for f in futures.values():
+                    try:
+                        f.cancel()
+                    except Exception:
+                        pass
+                futures.clear()
+                break
+
+        submit_until_full()
+
+    if dirty:
+        with CACHE_LOCK:
+            mark_state_dirty_locked(force=False)
+
+    return jsonify({
+        "items": results,
+        "count": len(results),
+        "stopped_early": bool(stopped_early),
+    })
 
 
 @app.get("/raw")
@@ -1329,7 +2096,6 @@ def api_debug_parse():
 
 
 if __name__ == "__main__":
-    # Lokalus paleidimas (Render'e paleidžiama su gunicorn)
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "5000"))
     app.run(host=host, port=port, debug=False)

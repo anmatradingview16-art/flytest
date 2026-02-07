@@ -1,9 +1,10 @@
-# fly.toml app configuration file generated for test-x0suew on 2026-02-07T06:57:46Z
+# fly.toml app configuration file generated for flytest-ptc4ea on 2026-02-07T10:33:19Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'test-x0suex'
+app = 'flytest-ptc4ea'
+primary_region = 'ams'
 
 [build]
 

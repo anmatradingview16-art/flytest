@@ -59,7 +59,7 @@ MAX_BATCH_IDS = int(os.getenv("MAX_BATCH_IDS", "1000"))
 MAX_CACHE_BATCH_IDS = int(os.getenv("MAX_CACHE_BATCH_IDS", str(max(2000, MAX_BATCH_IDS))))
 
 # Tikslinės svetainės lygiagretumas (kiek max vienu metu fetch'inti į aruodas.lt)
-TARGET_CONCURRENCY = int(os.getenv("TARGET_CONCURRENCY", "3"))
+TARGET_CONCURRENCY = int(os.getenv("TARGET_CONCURRENCY", "10"))
 if TARGET_CONCURRENCY < 1:
     TARGET_CONCURRENCY = 1
 if TARGET_CONCURRENCY > 10:
@@ -2042,3 +2042,4 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "5000"))
     app.run(host=host, port=port, debug=False)
+

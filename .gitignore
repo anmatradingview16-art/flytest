@@ -1,0 +1,4 @@
+aruodas_state.json
+*.tmp
+__pycache__/
+.venv/

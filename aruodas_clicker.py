@@ -16,6 +16,9 @@ OPTIMIZACIJOS (2026):
 - Pridėtas /api/cache_batch: UI puslapio statusus užkrauna iš cache be fetch į tikslą.
 - PRIDĖTA: greičio rodymas (kiek realių fetch'ų per minutę) UI.
 - PRIDĖTA: iki 3 lygiagrečių užklausų į tikslinę svetainę (ThreadPoolExecutor + semaphore).
+
+ŠI VERSIJA:
+- TIKRINA VISUS ID IŠ EILĖS (tiek lyginius, tiek nelyginius) -> STEP=1.
 """
 
 import re
@@ -38,9 +41,9 @@ from bs4 import BeautifulSoup
 # =========================
 # Konfigūracija (DEFAULT)
 # =========================
-DEFAULT_START_NUM = 3000001
+DEFAULT_START_NUM = 3000000
 DEFAULT_END_NUM = 3000033
-DEFAULT_STEP = 2  # tik nelyginiai -> STEP=2
+DEFAULT_STEP = 1  # VISI -> STEP=1
 
 START_NUM = DEFAULT_START_NUM
 END_NUM = DEFAULT_END_NUM
@@ -50,34 +53,30 @@ STEP = DEFAULT_STEP
 MAX_RANGE_ITEMS = int(os.getenv("MAX_RANGE_ITEMS", "120000"))
 
 # Maksimalus batch dydis (kiek ID galima paduoti į /api/check_batch vienu kartu)
-# PADIDINTA iki 1000 pagal prašymą (galima overridinti per env).
 MAX_BATCH_IDS = int(os.getenv("MAX_BATCH_IDS", "1000"))
 
-# Cache batch (be fetch į tikslą) – galima didesnė, bet UI paprastai naudos iki 1000.
+# Cache batch (be fetch į tikslą)
 MAX_CACHE_BATCH_IDS = int(os.getenv("MAX_CACHE_BATCH_IDS", str(max(2000, MAX_BATCH_IDS))))
 
-# PRIDĖTA: tikslinės svetainės lygiagretumas (kiek max vienu metu fetch'inti į aruodas.lt)
-TARGET_CONCURRENCY = int(os.getenv("TARGET_CONCURRENCY", "10"))
+# Tikslinės svetainės lygiagretumas (kiek max vienu metu fetch'inti į aruodas.lt)
+TARGET_CONCURRENCY = int(os.getenv("TARGET_CONCURRENCY", "3"))
 if TARGET_CONCURRENCY < 1:
     TARGET_CONCURRENCY = 1
-# Safety cap – jei kas nors per env uždėtų nesąmoningai didelį skaičių.
 if TARGET_CONCURRENCY > 10:
     TARGET_CONCURRENCY = 10
 
 # Keičiamas rate limit (per UI mygtukus)
 MIN_INTERVAL_SECONDS = 2.0  # default
 
-# Jitter: sumažintas, proporcingas, su lubomis (kad nebedominuotų prie 0.02/0.05).
+# Jitter: proporcingas + lubos
 JITTER_FRAC = (0.02, 0.15)         # 2%..15% nuo MIN_INTERVAL_SECONDS
 JITTER_CAP_SECONDS = (0.02, 0.15)  # absoliučios lubos sekundėmis
 
-# Pradinė reikšmė (vėliau perskaičiuojama per recompute_jitter())
 JITTER_SECONDS = (
     min(JITTER_CAP_SECONDS[0], MIN_INTERVAL_SECONDS * JITTER_FRAC[0]),
     min(JITTER_CAP_SECONDS[1], MIN_INTERVAL_SECONDS * JITTER_FRAC[1]),
 )
 
-# UI mygtukai
 ALLOWED_RATE_LIMITS = [0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
 
 USER_AGENT = (
@@ -110,13 +109,9 @@ _dirty_since_save = 0
 _last_request_at = 0.0
 _rate_lock = threading.Lock()
 
-# PRIDĖTA: max 3 (ar TARGET_CONCURRENCY) vienu metu fetch į tikslą
 TARGET_SEM = threading.BoundedSemaphore(TARGET_CONCURRENCY)
-
-# PRIDĖTA: executor, kuris vykdo fetch'us lygiagrečiai
 EXECUTOR = ThreadPoolExecutor(max_workers=TARGET_CONCURRENCY)
 
-# Thread-local Session (requests.Session nėra idealu share'inti tarp thread'ų)
 _thread_local = threading.local()
 
 _SESSION_HEADERS = {
@@ -129,7 +124,9 @@ _SESSION_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+
 def get_session() -> requests.Session:
+    # requests.Session nėra idealu share'inti tarp thread'ų -> thread-local
     s = getattr(_thread_local, "session", None)
     if s is None:
         s = requests.Session()
@@ -137,10 +134,11 @@ def get_session() -> requests.Session:
         _thread_local.session = s
     return s
 
-# Cache atmintyje
-CACHE = {}  # id -> parsed result (be raw_html)
 
-# RAW_CACHE: LRU, kad nešautų į RAM, kai tikrini daug ID
+# Cache atmintyje
+CACHE: dict[str, dict] = {}  # id -> parsed result (be raw_html)
+
+# RAW_CACHE: LRU
 RAW_CACHE = OrderedDict()  # id -> raw_html (tik tiems, kuriuos tikrinai; NEPERSISTINAM)
 RAW_CACHE_MAX_ITEMS = int(os.getenv("RAW_CACHE_MAX_ITEMS", "200"))
 RAW_CACHE_MAX_BYTES = int(os.getenv("RAW_CACHE_MAX_BYTES", "500000"))
@@ -175,24 +173,14 @@ def range_count(start: int, end: int, step: int) -> int:
 
 def normalize_range(start: int, end: int, step: int) -> tuple[int, int, int]:
     """Normalizuoja intervalą:
-    - STEP kol kas palaikomas tik 2 (tik nelyginiai).
-    - jei start/end lyginiai, pakoreguoja į nelyginius.
+    - STEP palaikomas tik 1 (visi).
     - riboja max įrašų skaičių.
     """
-    if step != 2:
-        raise ValueError("Šiuo metu palaikomas tik STEP=2 (tik nelyginiai ID).")
+    if step != 1:
+        raise ValueError("Šiuo metu palaikomas tik STEP=1 (visi ID).")
 
     if start > end:
         raise ValueError("start negali būti didesnis už end.")
-
-    # automatinė korekcija į nelyginius
-    if start % 2 == 0:
-        start += 1
-    if end % 2 == 0:
-        end -= 1
-
-    if start > end:
-        raise ValueError("Po nelyginių korekcijos intervalas tuščias.")
 
     cnt = range_count(start, end, step)
     if cnt > MAX_RANGE_ITEMS:
@@ -201,8 +189,8 @@ def normalize_range(start: int, end: int, step: int) -> tuple[int, int, int]:
     return start, end, step
 
 
-def in_range_and_odd(n: int) -> bool:
-    return START_NUM <= n <= END_NUM and (n % 2 == 1)
+def in_range(n: int) -> bool:
+    return START_NUM <= n <= END_NUM
 
 
 def id_num(id_str: str) -> int:
@@ -218,15 +206,15 @@ def normalize_id(id_like: str) -> str:
     s = s.replace("www.aruodas.lt/", "")
     s = s.strip("/")
     if not re.fullmatch(r"1-\d+", s):
-        raise ValueError("Netinkamas ID formatas. Pvz: 1-2890001")
+        raise ValueError("Netinkamas ID formatas. Pvz: 1-3000000")
     return s
 
 
 def parse_range_value(v) -> int:
     """Priimam start/end kaip:
     - int
-    - '3000001'
-    - '1-3000001'
+    - '3000000'
+    - '1-3000000'
     """
     if v is None:
         raise ValueError("Trūksta start arba end reikšmės.")
@@ -245,7 +233,7 @@ def parse_range_value(v) -> int:
     if re.fullmatch(r"\d+", s):
         return int(s)
 
-    raise ValueError("Netinkamas start/end formatas. Naudok skaičių (pvz 3000001) arba ID (pvz 1-3000001).")
+    raise ValueError("Netinkamas start/end formatas. Naudok skaičių (pvz 3000000) arba ID (pvz 1-3000000).")
 
 
 def _safe_float(x, default: float) -> float:
@@ -273,7 +261,6 @@ def recompute_jitter():
 
 
 def is_allowed_rate(x: float) -> bool:
-    """Tolerantiškas float palyginimas."""
     try:
         xf = float(x)
     except Exception:
@@ -282,16 +269,12 @@ def is_allowed_rate(x: float) -> bool:
 
 
 def snap_rate(x: float) -> float:
-    """Prikabina prie artimiausios leidžiamos reikšmės (saugesnis float atvejais)."""
     xf = float(x)
     return min(ALLOWED_RATE_LIMITS, key=lambda r: abs(r - xf))
 
 
 def rate_limit():
-    """Globalus rate-limit (bendras visiems thread'ams).
-    Konkurencija leidžia turėti iki TARGET_CONCURRENCY inflight request'ų,
-    bet startai vis tiek ribojami MIN_INTERVAL_SECONDS.
-    """
+    """Globalus rate-limit (bendras visiems thread'ams)."""
     global _last_request_at
     with _rate_lock:
         now = time.monotonic()
@@ -427,7 +410,7 @@ def parse_html(html_text: str, final_url: str = "", http_status: int | None = No
             _, dist2 = parse_city_district_from_url(final_url)
             district = dist2 or district
     else:
-        # tavo taisyklė: jei miestas ne Vilnius – miesto/rajono nerodom
+        # taisyklė: jei miestas ne Vilnius – miesto/rajono nerodom
         district = None
         city = None
 
@@ -438,12 +421,9 @@ def parse_html(html_text: str, final_url: str = "", http_status: int | None = No
 
 
 def fetch_and_parse(id_str: str) -> tuple[dict, str]:
-    """Fetch + parse vienam ID.
-    PRIDĖTA: leidžia iki TARGET_CONCURRENCY paralelinių fetch'ų (TARGET_SEM).
-    """
+    """Fetch + parse vienam ID. Leidžia iki TARGET_CONCURRENCY paralelinių fetch'ų."""
     url = f"https://www.aruodas.lt/{id_str}/"
 
-    # max TARGET_CONCURRENCY inflight request'ų į tikslą
     with TARGET_SEM:
         rate_limit()
         session = get_session()
@@ -514,7 +494,6 @@ def load_state_from_disk():
                 if isinstance(k, str) and isinstance(v, dict) and "id" in v:
                     CACHE[k] = v
 
-    # reset "dirty" state po load
     _last_state_save_mono = time.monotonic()
     _dirty_since_save = 0
 
@@ -572,7 +551,7 @@ def _iter_cached_in_current_range_locked():
     for id_str, entry in CACHE.items():
         try:
             n = id_num(id_str)
-            if in_range_and_odd(n):
+            if in_range(n):
                 yield id_str, entry
         except Exception:
             continue
@@ -695,7 +674,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <div class="bar">
-    <span class="pill" id="rangePill">ID intervalas: <b class="mono" id="pillStart">1-__START__</b> … <b class="mono" id="pillEnd">1-__END__</b> (tik nelyginiai)</span>
+    <span class="pill" id="rangePill">ID intervalas: <b class="mono" id="pillStart">1-__START__</b> … <b class="mono" id="pillEnd">1-__END__</b> (visi, STEP=1)</span>
     <span class="pill" id="countPill">Kiekis: <b class="mono" id="countVal">—</b></span>
     <span class="pill">User-Agent: <span class="mono">__UA__</span></span>
     <span class="pill" id="ratePill">Rate limit: min <b class="mono" id="rateVal">__MIN__</b>s + jitter</span>
@@ -708,7 +687,7 @@ INDEX_HTML = r"""<!doctype html>
     <input id="rangeStart" type="number" step="1" value="__START__" />
     <input id="rangeEnd" type="number" step="1" value="__END__" />
     <button id="btnGenerate">Generuoti sąrašą</button>
-    <small class="muted">Tik nelyginiai, STEP=2. Jei įvesi lyginį – serveris pakoreguos į nelyginį.</small>
+    <small class="muted">Ši versija tikrina VISUS ID (lyginius+nelyginius) – STEP=1.</small>
   </div>
 
   <div class="bar">
@@ -737,7 +716,7 @@ INDEX_HTML = r"""<!doctype html>
       <option value="500">500</option>
       <option value="1000">1000</option>
     </select>
-    <small class="muted">Tai nėra lygiagretūs connectionai UI pusėje – serveris pats vykdo iki __CONC__ fetch'ų į tikslą.</small>
+    <small class="muted">Serveris vykdo iki __CONC__ fetch'ų į tikslą.</small>
   </div>
 
   <div class="bar">
@@ -746,7 +725,7 @@ INDEX_HTML = r"""<!doctype html>
     <button id="btnRandom">Atsitiktinis ID</button>
     <button id="btnForce">Tikrinti (force)</button>
     <button id="btnAutoToggle">▶ Auto (OFF)</button>
-    <small class="muted">Auto eina per netikrintus ID. Sustos, jei gaus <b>ERROR</b>.</small>
+    <small class="muted">Auto eina per netikrintus ID iš eilės. Sustos, jei gaus <b>ERROR</b>.</small>
   </div>
 
   <div class="grid">
@@ -838,7 +817,7 @@ let autoRunning = false;
 let autoStopRequested = false;
 let autoNextNum = START;
 
-// State krovimo apsauga (fix nuo race bug'ų)
+// State krovimo apsauga
 let stateLoading = false;
 let statePromise = null;
 
@@ -876,7 +855,7 @@ let AUTO_BATCH_SIZE = parseInt(localStorage.getItem("autoBatchSize") || "50", 10
 if(!Number.isFinite(AUTO_BATCH_SIZE) || AUTO_BATCH_SIZE <= 0) AUTO_BATCH_SIZE = 50;
 if(!AUTO_BATCH_OPTIONS.includes(AUTO_BATCH_SIZE)) AUTO_BATCH_SIZE = 50;
 
-// „Visi ID“ puslapiavimas (kad nestrigtų naršyklė su 50k+ intervalais)
+// „Visi ID“ puslapiavimas
 const PAGE_SIZE_OPTIONS = [100,250,500,1000];
 let PAGE_SIZE = parseInt(localStorage.getItem("pageSize") || "500", 10);
 if(!Number.isFinite(PAGE_SIZE) || PAGE_SIZE <= 0) PAGE_SIZE = 500;
@@ -898,7 +877,7 @@ function checkedCount(){
 function numFromId(id) { const m=/^1-(\d+)$/.exec(id); return m?parseInt(m[1],10):NaN; }
 function makeId(n){ return "1-"+String(n); }
 
-function randomOddInRange(){
+function randomInRange(){
   const count = totalCount();
   const k = Math.floor(Math.random()*count);
   return START + k*STEP;
@@ -1132,7 +1111,6 @@ async function loadCacheForVisiblePage(){
 
   updatePagePill("kraunama…");
 
-  // chunk'inam, kad neperlenktume lazdos su payload
   const chunks = chunkArray(need, 500);
 
   for(const chunk of chunks){
@@ -1166,28 +1144,21 @@ function jumpToId(idLike){
   else if(/^\d+$/.test(s)) n = parseInt(s,10);
 
   if(!Number.isFinite(n)){
-    alert("Netinkamas ID / skaičius. Pvz: 1-3000001");
+    alert("Netinkamas ID / skaičius. Pvz: 1-3000000");
     return;
   }
   if(n < START || n > END){
     alert("ID ne intervale.");
     return;
   }
-  if(n % 2 === 0){
-    // automatiškai šokam į artimiausią nelyginį
-    n = n + 1;
-    if(n > END) n = n - 2;
-  }
 
   const idx = Math.floor((n - START) / STEP);
   const page = Math.floor(idx / PAGE_SIZE);
   setPage(page);
 
-  // atnaujinam input
   const jump = document.getElementById("jumpTo");
   if(jump) jump.value = makeId(n);
 
-  // lengvas highlight (nebūtina, bet patogu)
   setTimeout(()=>{
     const id = makeId(n);
     const row = document.querySelector(`#allBody tr[data-id="${CSS.escape(id)}"]`);
@@ -1198,9 +1169,7 @@ function jumpToId(idLike){
   }, 50);
 }
 
-// jei sugiharos rasta, laikom kaip "rastas" net jei CHALLENGE
 function applyResultToUi(data, doSort=true){
-  // greitis (tik realūs fetch'ai, ne cache)
   recordSpeed(data);
   updateSpeedUi();
 
@@ -1223,7 +1192,6 @@ function applyResultToUi(data, doSort=true){
   }
 }
 
-// Single check async
 async function checkId(id, force=false, silent=false){
   let resp, data;
   try{
@@ -1267,7 +1235,6 @@ async function checkId(id, force=false, silent=false){
   return data;
 }
 
-// Batch check (mažiau API overhead)
 async function checkBatch(ids, force=false, silent=false, stopOnError=false){
   let resp, data;
   try{
@@ -1361,7 +1328,6 @@ async function setRangeOnServer(startVal, endVal){
   return true;
 }
 
-// Auto UI / toggle
 function setControlsDisabled(disabled, disableAuto=false){
   const autoBtn = document.getElementById("btnAutoToggle");
   if(autoBtn){
@@ -1394,14 +1360,13 @@ function setAutoButtonUi(){
   btn.textContent = autoRunning ? "⏸ Auto (STOP)" : "▶ Auto (OFF)";
 }
 
-// randa batch sąrašą netikrintų ID (iki limit), pradedant nuo fromNum
 function findNextUncheckedBatch(fromNum, limit){
   const total = totalCount();
   let n = fromNum;
   const out = [];
 
   for(let i=0;i<total && out.length<limit;i++){
-    if(n > END) n = START;
+    if(n > END) n = START; // wrap – jei kažką praleidai, vis tiek viską patikrins
     const id = makeId(n);
     if(!checkedIds.has(id)){
       out.push({id, n});
@@ -1440,7 +1405,6 @@ async function runAuto(){
 
     const items = await checkBatch(ids, false, true, true);
 
-    // pritaikom UI vienu kartu (be sort kiekvienam įrašui)
     for(const item of items){
       applyResultToUi(item, false);
     }
@@ -1448,7 +1412,6 @@ async function runAuto(){
     applyFilter();
     updateAutoPill();
 
-    // jei batch'e gavom error – stop
     const bad = items.find(it => (it && (it.status === "ERROR" || it.error)));
     if(bad){
       const bid = bad.id || (ids[0] || "");
@@ -1456,8 +1419,6 @@ async function runAuto(){
       break;
     }
 
-    // pastumiam pointerį į sekantį po paskutinio apdoroto
-    // (serveris su stop_on_error grąžina prefix'ą, todėl čia logika lieka teisinga)
     const processed = items.length;
     if(processed <= 0){
       updateAutoPill("SUSTABDYTA: tuščias batch atsakymas");
@@ -1484,7 +1445,6 @@ function stopAuto(){
   updateAutoPill("stabdoma…");
 }
 
-// Persisted state + dynamic range užkrovimas
 async function reloadEverything(){
   if(stateLoading && statePromise) return statePromise;
 
@@ -1504,7 +1464,6 @@ async function reloadEverything(){
       document.getElementById("foundBody").innerHTML = "";
       document.getElementById("allBody").innerHTML = "";
 
-      // PAGRINDINĖ OPTIMIZACIJA: nekraunam visų item'ų, o tik FOUND (ir gaunam checked_ids).
       const resp = await fetch("/api/state?items=found&include_ids=1");
       const state = await resp.json();
 
@@ -1514,13 +1473,12 @@ async function reloadEverything(){
       }
 
       const rng = state.range || {};
-      if(rng.start && rng.end && rng.step){
+      if(rng.start !== undefined && rng.end !== undefined && rng.step !== undefined){
         START = parseInt(rng.start,10);
         END   = parseInt(rng.end,10);
         STEP  = parseInt(rng.step,10);
       }
 
-      // checked IDs (auto progresui + skip)
       const ids = state.checked_ids || [];
       for(const id of ids){
         checkedIds.add(id);
@@ -1528,14 +1486,12 @@ async function reloadEverything(){
 
       updateRangeUi();
 
-      // FOUND items (rodoma kairėje)
       const items = state.items || [];
       for(const item of items){
         applyResultToUi(item, false);
       }
       sortFoundTable();
 
-      // render pirmą puslapį ir užkraunam jo cache statusus (tik tiems ID, kurie jau tikrinti)
       renderAllPage();
       await loadCacheForVisiblePage();
 
@@ -1559,7 +1515,6 @@ async function reloadEverything(){
   return statePromise;
 }
 
-// Click handleriai
 document.addEventListener("click",async(e)=>{
   const btn=e.target.closest("button[data-action='check']");
   if(btn) await checkId(btn.dataset.id,false,false);
@@ -1578,7 +1533,7 @@ document.getElementById("btnForce").addEventListener("click",async()=>{
   await checkId(document.getElementById("idInput").value.trim(),true,false);
 });
 document.getElementById("btnRandom").addEventListener("click",async()=>{
-  const id=makeId(randomOddInRange());
+  const id=makeId(randomInRange());
   document.getElementById("idInput").value=id;
   await checkId(id,false,false);
 });
@@ -1591,7 +1546,6 @@ document.getElementById("btnAutoToggle").addEventListener("click", async()=>{
   await runAuto();
 });
 
-// Batch size UI
 const batchSel = document.getElementById("batchSize");
 if(batchSel){
   batchSel.value = String(AUTO_BATCH_SIZE);
@@ -1605,14 +1559,12 @@ if(batchSel){
   });
 }
 
-// Page size UI
 const pageSel = document.getElementById("pageSize");
 if(pageSel){
   pageSel.value = String(PAGE_SIZE);
   pageSel.addEventListener("change", ()=>{
     const v = parseInt(pageSel.value, 10);
     if(Number.isFinite(v) && v > 0){
-      // išlaikom pirmo matomo ID indeksą, kad "nešokinėtų"
       const firstIdx = currentPage * PAGE_SIZE;
       PAGE_SIZE = v;
       localStorage.setItem("pageSize", String(v));
@@ -1637,7 +1589,6 @@ document.getElementById("jumpTo").addEventListener("keydown", (e)=>{
   }
 });
 
-// Generuoti sąrašą pagal naują intervalą
 document.getElementById("btnGenerate").addEventListener("click", async()=>{
   if(autoRunning){
     alert("Sustabdyk Auto prieš keičiant intervalą.");
@@ -1727,7 +1678,6 @@ def api_state():
 
     include_ids = (request.args.get("include_ids", "1") != "0")
 
-    # optional slicing
     try:
         offset = int(request.args.get("offset", "0"))
     except Exception:
@@ -1785,7 +1735,7 @@ def api_cache_batch():
     ids = payload.get("ids", None)
 
     if not isinstance(ids, list) or not ids:
-        return jsonify({"error": "ids turi būti sąrašas (pvz. {ids:[\"1-3000001\", ...]})."}), 400
+        return jsonify({"error": "ids turi būti sąrašas (pvz. {ids:[\"1-3000000\", ...]})."}), 400
     if len(ids) > MAX_CACHE_BATCH_IDS:
         return jsonify({"error": f"Per didelis cache batch: {len(ids)}. Max: {MAX_CACHE_BATCH_IDS}."}), 400
 
@@ -1895,8 +1845,8 @@ def api_check():
     try:
         id_str = normalize_id(id_like)
         n = id_num(id_str)
-        if not in_range_and_odd(n):
-            return jsonify({"error": "ID ne intervale arba ne nelyginis", "id": id_str}), 400
+        if not in_range(n):
+            return jsonify({"error": "ID ne intervale", "id": id_str}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -1947,19 +1897,18 @@ def api_check_batch():
     stop_on_error = str(payload.get("stop_on_error", "0")).lower() in ("1", "true", "yes", "y")
 
     if not isinstance(ids, list) or not ids:
-        return jsonify({"error": "ids turi būti sąrašas (pvz. {ids:[\"1-3000001\", ...]})."}), 400
+        return jsonify({"error": "ids turi būti sąrašas (pvz. {ids:[\"1-3000000\", ...]})."}), 400
 
     if len(ids) > MAX_BATCH_IDS:
         return jsonify({"error": f"Per didelis batch: {len(ids)}. Max: {MAX_BATCH_IDS}."}), 400
 
-    # normalizuojam ir tikrinam
     norm_ids: list[str] = []
     try:
         for x in ids:
             id_str = normalize_id(str(x))
             n = id_num(id_str)
-            if not in_range_and_odd(n):
-                raise ValueError(f"ID ne intervale arba ne nelyginis: {id_str}")
+            if not in_range(n):
+                raise ValueError(f"ID ne intervale: {id_str}")
             norm_ids.append(id_str)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -1968,7 +1917,7 @@ def api_check_batch():
     dirty = False
     stopped_early = False
 
-    # ===== PRIDĖTA: pipeline su iki TARGET_CONCURRENCY lygiagrečių fetch'ų =====
+    # pipeline su iki TARGET_CONCURRENCY lygiagrečių fetch'ų
     futures: dict[int, object] = {}
     next_to_submit = 0
 
@@ -1981,7 +1930,6 @@ def api_check_batch():
                 with CACHE_LOCK:
                     cached2 = CACHE.get(id_str2)
                 if cached2 is not None:
-                    # cache hit – nesiunčiam future, bus grąžinta kai ateis eilė
                     next_to_submit += 1
                     continue
 
@@ -1991,7 +1939,6 @@ def api_check_batch():
     submit_until_full()
 
     for i, id_str in enumerate(norm_ids):
-        # cache hit – grąžinam iš karto (kaip seniau)
         if not force:
             with CACHE_LOCK:
                 cached = CACHE.get(id_str)
@@ -2002,10 +1949,8 @@ def api_check_batch():
                 submit_until_full()
                 continue
 
-        # reikia fetch
         fut = futures.pop(i, None)
         if fut is None:
-            # jei netyčia nebuvo užsakyta (pvz daug cache skip'ų) – užsakome dabar
             fut = EXECUTOR.submit(fetch_and_parse, id_str)
 
         try:
@@ -2043,7 +1988,6 @@ def api_check_batch():
 
             if stop_on_error:
                 stopped_early = True
-                # cancel likusius (best effort)
                 for f in futures.values():
                     try:
                         f.cancel()
@@ -2082,7 +2026,6 @@ def raw():
             mimetype="text/plain; charset=utf-8"
         ), 404
 
-    # text/plain – kad naršyklė nepaleistų jokių skriptų
     return Response(raw_html, mimetype="text/plain; charset=utf-8")
 
 
